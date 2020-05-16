@@ -5,15 +5,50 @@ from sklearn import svm
 from sklearn import metrics
 from nitime.algorithms.autoregressive import AR_est_LD
 from sklearn.preprocessing import StandardScaler
+import pywt
+from scipy.ndimage import zoom
+from scipy import signal
 import glob
 import os
 import random
+import math
 
 random.seed(101)
 
-def read_emg(path):
+def dict_product(dicts):
+    result = []
+    for d in dicts:
+        result += list((dict(zip(d, x))) for x in product(*d.values()))
+    return result
+
+def samples_num_in_window(frequency, window_size_ms):
+    return int(window_size_ms * frequency / 1000)
+
+def emg_data_windowing(data, window_size):
+    data_win = np.copy(data)
+    data_x = data_win[:,:-1]
+    data_y = data_win[:,-1]
+    n, m = data_x.shape
+    size = n * m
+    residual_rows_num =  n % window_size
+    if residual_rows_num != 0:
+        data_x = data_x[:-residual_rows_num,:]
+        data_y = data_y[:-residual_rows_num]
+    data_x = data_x.reshape((-1, m * window_size))
+    
+    data_y = data_y.reshape((-1, window_size))
+    data_y = np.array(list(map(np.mean, data_y)))
+    
+    mixed_classes_idxs = np.where(data_y % 1 != 0)
+    
+    data_win = np.c_[data_x, data_y]
+    data_win = np.delete(data_win, mixed_classes_idxs, 0)
+    
+    return data_win
+
+def read_emg(data_path):
     sessions_csv = []
-    for path, _, files in os.walk(path):
+    for path, _, files in os.walk(data_path):
         for name in files:
             sessions_csv.append(os.path.join(path, name))
 
@@ -28,42 +63,10 @@ def read_emg(path):
     data_y = data_y.repeat(8)
     data_y = data_y.reshape((-1,1))
     data = np.concatenate((data_x, data_y), axis=1)
-    print('All sessions shape: ', data.shape)
+    print('result shape: ', data.shape)
 
     return data
 
-def emg_windowing(data, window_size):
-    data_x = data[:,:-1]
-    data_y = data[:,-1]
-    n, m = data_x.shape
-#     print('shape: ', n, m)
-    size = n * m
-#     print('size: ', size)
-    residual_rows_num =  n % window_size
-#     print('delete ', residual_rows_num, 'rows')
-    if residual_rows_num != 0:
-        data_x = data_x[:-residual_rows_num,:]
-        data_y = data_y[:-residual_rows_num]
-#     print('data_x: ', data_x.shape)
-#     print('data_y: ', data_y.shape)
-    data_x = data_x.reshape((-1, m * window_size))
-    
-    data_y = data_y.reshape((-1, window_size))
-    data_y = np.array(list(map(np.mean, data_y)))
-#     print('data_x: ', data_x.shape)
-#     print('data_y: ', data_y.shape)
-    
-    mixed_classes_idxs = np.where(data_y % 1 != 0)
-#     print('mixed_classes_idxs: ', mixed_classes_idxs)
-#     print(mixed_classes_idxs[0])
-    
-    data = np.c_[data_x, data_y]
-    data = np.delete(data, mixed_classes_idxs, 0)
-    
-    return data
-
-
-import math
 
 def integrated_absolute_value(segment):
     return sum([abs(s) for s in segment])
@@ -103,42 +106,58 @@ def autoregression_coefficients(emg, order):
     return coef
 
 
-def calculate_features(data_x, channels_num):
+def calculate_features(data_x, channels_num, ar_features=True):
     n, m = data_x.shape
     features = []
     
     for channel in range(channels_num):
         channel_features = []
         
-        # Calculate MAV, ZC, SSC, WL features
+        # Calculate MAV, ZC, SSC, WL, RMS features
         channel_features.append(list(map(mean_absolute_value, data_x[:,channel::channels_num])))
         channel_features.append(list(map(waveform_length, data_x[:,channel::channels_num])))
         channel_features.append(list(map(zero_crossing, data_x[:,channel::channels_num])))
         channel_features.append(list(map(slope_sign_changes, data_x[:,channel::channels_num])))
+        channel_features.append(list(map(root_mean_square, data_x[:,channel::channels_num])))
         
-        # calculate AR6 coefficients
-        ar_order = 6
-        ar_coef = np.array(list(map(lambda x: autoregression_coefficients(x, ar_order), data_x[:,channel::channels_num])))
-        channel_features += ar_coef.transpose().tolist()
+        if ar_features:
+            # calculate AR6 coefficients
+            ar_order = 6
+            ar_coef = np.array(list(map(lambda x: autoregression_coefficients(x, ar_order), data_x[:,channel::channels_num])))
+            channel_features += ar_coef.transpose().tolist()
+        
         features += channel_features
     
     return np.array(features).transpose()
 
 
-data = read_emg('5sessions')
-emg_windows = emg_windowing(data, 40)
+def calculate_CWT_vector(row, zoom_factor):
+    coef, freqs = pywt.cwt(row, scales=np.arange(1, 33), wavelet='mexh')
+    coef = zoom(coef, zoom_factor, order=0)
+    return coef.transpose()
 
-data_x = emg_windows[:,:-1]
-data_y = emg_windows[:,-1]
-features = calculate_features(data_x, 8)
-print('Features shape:', features.shape)
+def calculate_CWT(data_x, channels_num, zoom_factor):
+    features = []
+    for channel in range(channels_num):        
+        coef = list(map(lambda x: calculate_CWT_vector(x, zoom_factor), data_x[:,channel::channels_num]))
+        features.append(np.array(coef).transpose())
+    return np.array(features).transpose()
 
-train_x, test_x, train_y, test_y = train_test_split(features, data_y, test_size=0.3)
+from scipy import signal
 
-# Create svm Classifier
-clf = svm.SVC(kernel='linear')
-clf.fit(train_x, train_y)
-pred_y = clf.predict(test_x)
+def spectrogram(data_x, channels_num, fs, npserseg, noverlap):
+    features = []
+    for channel in range(channels_num):        
+        coef = list(map(lambda x: spectrogram_vector(x, fs, npserseg, noverlap), data_x[:,channel::channels_num]))
+        features.append(np.array(coef).transpose())
+    return np.array(features).transpose()
 
-print("Accuracy:", metrics.accuracy_score(test_y, pred_y))
+
+def spectrogram_vector(vector, fs, npserseg, noverlap):
+    frequencies_samples, time_segment_sample, spectrogram_of_vector = signal.spectrogram(x=vector, fs=fs,
+                                                                                         nperseg=npserseg,
+                                                                                         noverlap=noverlap,
+                                                                                         window="hann",
+                                                                                         scaling="spectrum")
+    return spectrogram_of_vector[1:]
 
